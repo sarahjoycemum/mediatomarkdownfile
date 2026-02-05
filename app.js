@@ -179,7 +179,7 @@
     });
   }
 
-  function processLink(url) {
+  async function processLink(url) {
     setStatus('Processing link...');
     let md = '';
     const title = $('#titleInput').value.trim() || extractTitleFromUrl(url);
@@ -191,6 +191,53 @@
     // Detect link type
     if (isYouTubeUrl(url)) {
       const videoId = extractYouTubeId(url);
+      const fetchTranscript = $('#optYtTranscript').checked;
+
+      if (fetchTranscript && videoId) {
+        try {
+          setStatus('Fetching YouTube transcript...');
+          showProgress(10);
+          const result = await fetchYouTubeTranscript(videoId);
+          showProgress(80);
+
+          const videoTitle = result.title || title;
+          md += `# ${videoTitle}\n\n`;
+          md += `**Channel:** ${result.author || 'Unknown'}  \n`;
+          md += `**Source:** [${url}](${url})\n\n`;
+
+          if ($('#optEmbedImages').checked) {
+            md += `[![Video Thumbnail](https://img.youtube.com/vi/${videoId}/maxresdefault.jpg)](${url})\n\n`;
+          }
+
+          md += `---\n\n## Transcript\n\n`;
+
+          const includeTimestamps = $('#optYtTimestamps').checked;
+          for (const para of result.paragraphs) {
+            if (includeTimestamps) {
+              md += `**[${para.timestamp}]** ${para.text}\n\n`;
+            } else {
+              md += `${para.text}\n\n`;
+            }
+          }
+
+          md += `---\n\n*Transcript fetched from YouTube video.*\n`;
+          showProgress(100);
+          hideProgress();
+
+          appendMarkdown(md, videoTitle);
+          linkInput.value = '';
+          setStatus('YouTube transcript converted to markdown');
+          showToast('YouTube transcript fetched and converted', 'success');
+          return;
+        } catch (err) {
+          hideProgress();
+          console.warn('Transcript fetch failed, falling back to embed:', err);
+          showToast('Could not fetch transcript — using embed instead. ' + err.message, 'error');
+          // Fall through to the basic embed below
+        }
+      }
+
+      // Basic YouTube embed (no transcript or transcript failed)
       md += `# ${title}\n\n`;
       md += `## Video\n\n`;
       md += `[![YouTube Video](https://img.youtube.com/vi/${videoId}/maxresdefault.jpg)](${url})\n\n`;
@@ -719,6 +766,193 @@
     const badge = item.querySelector('.queue-item-status');
     badge.className = `queue-item-status ${status}`;
     badge.textContent = status === 'done' ? 'Done' : status === 'error' ? 'Error' : 'Processing';
+  }
+
+  // ── YouTube Transcript Fetching ─────────────────────────────
+  const CORS_PROXIES = [
+    (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+    (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+    (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  ];
+
+  async function fetchWithCorsProxy(url) {
+    let lastError;
+    for (const makeProxy of CORS_PROXIES) {
+      const proxyUrl = makeProxy(url);
+      try {
+        const resp = await fetch(proxyUrl, { signal: AbortSignal.timeout(15000) });
+        if (resp.ok) {
+          return await resp.text();
+        }
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    throw new Error(lastError?.message || 'All CORS proxies failed');
+  }
+
+  async function fetchYouTubeTranscript(videoId) {
+    const lang = ($('#ytLangInput')?.value || 'en').trim();
+
+    // Step 1: Fetch the YouTube watch page to extract caption track info
+    setStatus('Fetching YouTube page data...');
+    showProgress(20);
+    const pageHtml = await fetchWithCorsProxy(`https://www.youtube.com/watch?v=${videoId}`);
+
+    // Extract video title
+    let videoTitle = 'Untitled Video';
+    let author = 'Unknown';
+    const titleMatch = pageHtml.match(/"title"\s*:\s*"([^"]+)"/);
+    if (titleMatch) {
+      videoTitle = JSON.parse(`"${titleMatch[1]}"`);
+    }
+    const authorMatch = pageHtml.match(/"author"\s*:\s*"([^"]+)"/);
+    if (authorMatch) {
+      author = JSON.parse(`"${authorMatch[1]}"`);
+    }
+
+    // Extract the captions player response
+    showProgress(35);
+    setStatus('Extracting caption data...');
+
+    const captionsMatch = pageHtml.match(/"captions"\s*:\s*(\{.*?"captionTracks".*?\])/);
+    if (!captionsMatch) {
+      throw new Error('No captions found for this video. It may not have subtitles enabled.');
+    }
+
+    // Parse the captions JSON — we need to extract the captionTracks array
+    let captionTracksJson;
+    try {
+      // Find the captionTracks array within the captions object
+      const tracksMatch = pageHtml.match(/"captionTracks"\s*:\s*(\[.*?\])/);
+      if (!tracksMatch) {
+        throw new Error('Could not parse caption tracks');
+      }
+      captionTracksJson = JSON.parse(tracksMatch[1]);
+    } catch (e) {
+      // Try a broader extraction
+      const broader = pageHtml.match(/"captionTracks"\s*:\s*(\[[\s\S]*?\]\s*)/);
+      if (!broader) {
+        throw new Error('Could not parse caption track data');
+      }
+      // Clean up and parse — the JSON may be truncated, so find the matching bracket
+      let raw = broader[1];
+      let depth = 0;
+      let end = 0;
+      for (let i = 0; i < raw.length; i++) {
+        if (raw[i] === '[') depth++;
+        else if (raw[i] === ']') depth--;
+        if (depth === 0) { end = i + 1; break; }
+      }
+      captionTracksJson = JSON.parse(raw.substring(0, end));
+    }
+
+    if (!captionTracksJson || !captionTracksJson.length) {
+      throw new Error('No caption tracks available for this video');
+    }
+
+    // Step 2: Find the best matching caption track
+    showProgress(45);
+    let track = captionTracksJson.find((t) => t.languageCode === lang);
+    if (!track) {
+      // Fall back to any available track
+      track = captionTracksJson.find((t) => t.languageCode === 'en') || captionTracksJson[0];
+    }
+
+    if (!track || !track.baseUrl) {
+      throw new Error('No usable caption track found');
+    }
+
+    // Step 3: Fetch the caption XML
+    setStatus('Downloading transcript...');
+    showProgress(55);
+    const captionXml = await fetchWithCorsProxy(track.baseUrl);
+
+    // Step 4: Parse the XML into transcript entries
+    showProgress(70);
+    setStatus('Parsing transcript...');
+    const entries = parseTranscriptXml(captionXml);
+
+    if (!entries.length) {
+      throw new Error('Transcript was empty');
+    }
+
+    // Step 5: Group into paragraphs
+    const paragraphs = groupTranscriptParagraphs(entries, 4.0);
+
+    return { title: videoTitle, author, paragraphs };
+  }
+
+  function parseTranscriptXml(xml) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xml, 'text/xml');
+    const textElements = doc.querySelectorAll('text');
+    const entries = [];
+
+    for (const el of textElements) {
+      const start = parseFloat(el.getAttribute('start') || '0');
+      const duration = parseFloat(el.getAttribute('dur') || '0');
+      // Decode HTML entities in the text
+      let text = el.textContent || '';
+      text = text.replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/\n/g, ' ')
+        .trim();
+
+      if (text) {
+        entries.push({ start, duration, text });
+      }
+    }
+    return entries;
+  }
+
+  function groupTranscriptParagraphs(entries, gapThreshold) {
+    if (!entries.length) return [];
+
+    const paragraphs = [];
+    let currentTexts = [];
+    let currentStart = entries[0].start;
+
+    for (let i = 0; i < entries.length; i++) {
+      currentTexts.push(entries[i].text);
+
+      if (i < entries.length - 1) {
+        const currentEnd = entries[i].start + entries[i].duration;
+        const nextStart = entries[i + 1].start;
+        const gap = nextStart - currentEnd;
+
+        if (gap >= gapThreshold) {
+          paragraphs.push({
+            timestamp: formatTranscriptTime(currentStart),
+            text: currentTexts.join(' '),
+          });
+          currentTexts = [];
+          currentStart = entries[i + 1].start;
+        }
+      }
+    }
+
+    // Last paragraph
+    if (currentTexts.length) {
+      paragraphs.push({
+        timestamp: formatTranscriptTime(currentStart),
+        text: currentTexts.join(' '),
+      });
+    }
+
+    return paragraphs;
+  }
+
+  function formatTranscriptTime(seconds) {
+    const total = Math.floor(seconds);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    return `${m}:${String(s).padStart(2, '0')}`;
   }
 
   // ── Utility Functions ───────────────────────────────────────
