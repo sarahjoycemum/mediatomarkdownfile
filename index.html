@@ -70,7 +70,7 @@
               placeholder="https://example.com/media-or-page">
             <button id="btnProcessLink" class="btn btn-primary">Fetch & Convert</button>
           </div>
-          <p class="link-hint">Supports: YouTube, image URLs, web pages, direct media links</p>
+          <p class="link-hint">Supports: YouTube links (with transcript!), image URLs, web pages, direct media links</p>
         </div>
 
         <!-- File Queue -->
@@ -82,6 +82,20 @@
         <!-- Conversion Options -->
         <div class="options-panel">
           <h3>Options</h3>
+          <div class="option-row">
+            <label>
+              <input type="checkbox" id="optYtTranscript" checked> Fetch YouTube transcript
+            </label>
+          </div>
+          <div class="option-row">
+            <label>
+              <input type="checkbox" id="optYtTimestamps"> Include timestamps in transcript
+            </label>
+          </div>
+          <div class="option-row">
+            <label for="ytLangInput">Transcript language:</label>
+            <input type="text" id="ytLangInput" class="input-title" placeholder="en" value="en" style="max-width:60px">
+          </div>
           <div class="option-row">
             <label>
               <input type="checkbox" id="optOcr"> OCR on images (extract text)
